@@ -1,0 +1,20 @@
+# Personal config / registry — never commit even if accidentally placed in repo
+/config
+/registry
+
+# Backups + swap
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor metadata
+.vscode/
+.idea/
+__pycache__/

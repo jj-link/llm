@@ -1,0 +1,946 @@
+#!/bin/bash
+# llm — Local LLM server launcher
+# Usage: llm up <model> [options]    Start a model
+#        llm down                    Stop the running server
+#        llm status                  Show what's running
+#        llm models                  List available models
+
+set -euo pipefail
+
+# Source user config if present. Override location with $LLM_CONFIG.
+# See config.example in the repo for the available variables.
+LLM_CONFIG_FILE="${LLM_CONFIG:-$HOME/.config/llm/config}"
+# shellcheck disable=SC1090
+[[ -f "$LLM_CONFIG_FILE" ]] && source "$LLM_CONFIG_FILE"
+
+# ── Config ──────────────────────────────────────────────────────────
+# All paths overridable via environment. Defaults assume a single-user setup.
+#   LLM_MODELS_DIR        — where downloaded GGUFs live (default: ~/models)
+#   LLM_BUUN_BIN          — buun-llama-cpp llama-server binary
+#   LLM_ROTOR_BIN         — rotorquant-llama-cpp llama-server binary
+#   LLM_PORT, LLM_CTX, LLM_KV, LLM_GPU — defaults for `llm up`
+#   LLM_HERMES_CONFIG     — Hermes provider YAML (default: ~/.hermes/config.yaml)
+#   LLM_CCR_CONFIG        — claude-code-router JSON. Empty (default) disables
+#                           the CCR routing integration entirely.
+#   LLM_REGISTRY          — model registry file (default: ~/.config/llm/registry)
+#                           Auto-created on first `llm add`.
+#   LLM_SERVER_HOST       — host/IP that llama-server's URL points at, used by
+#                           the CCR integration. "auto" = first IP from
+#                           `hostname -I` (right for WSL→Windows). Set to
+#                           "localhost" on native Linux when CCR is co-located.
+MODELS_DIR="${LLM_MODELS_DIR:-$HOME/models}"
+BUUN_BIN="${LLM_BUUN_BIN:-$HOME/buun-llama-cpp/build/bin/llama-server}"
+ROTOR_BIN="${LLM_ROTOR_BIN:-$HOME/rotorquant-llama-cpp/build/bin/llama-server}"
+DEFAULT_PORT="${LLM_PORT:-8081}"
+DEFAULT_CTX="${LLM_CTX:-128k}"
+DEFAULT_KV="${LLM_KV:-f16}"
+DEFAULT_GPU="${LLM_GPU:-0}"
+DEFAULT_NP=1
+PIDFILE="/tmp/llm-server.pid"
+HERMES_CONFIG="${LLM_HERMES_CONFIG:-$HOME/.hermes/config.yaml}"
+CCR_CONFIG="${LLM_CCR_CONFIG:-}"
+REGISTRY_FILE="${LLM_REGISTRY:-$HOME/.config/llm/registry}"
+SERVER_HOST="${LLM_SERVER_HOST:-auto}"
+
+# ── Colors ──────────────────────────────────────────────────────────
+R='\033[0m' B='\033[1m' D='\033[2m'
+G='\033[32m' Y='\033[33m' C='\033[36m' RD='\033[31m' M='\033[35m'
+
+# ── Model registry ──────────────────────────────────────────────────
+# Populated/maintained by `llm add` and `llm remove`. Lives in $REGISTRY_FILE
+# so personal model paths stay out of version control.
+declare -A MODEL_PATHS=()
+declare -A MODEL_SIZES=()
+# shellcheck disable=SC1090
+[[ -f "$REGISTRY_FILE" ]] && source "$REGISTRY_FILE"
+
+# ── KV cache presets ────────────────────────────────────────────────
+# Format: binary_var|ctk_type|ctv_type
+declare -A KV_PRESETS=(
+    [tcq]="buun|turbo3_tcq|turbo3_tcq"
+    [tcq2]="buun|turbo2_tcq|turbo2_tcq"
+    [rotor]="rotor|iso3|iso3"
+    [rotor-planar]="rotor|planar3|planar3"
+    [rotor4]="rotor|iso4|iso4"
+    [q8]="buun|q8_0|q8_0"
+    [q4]="buun|q4_0|q4_0"
+    [f16]="buun|f16|f16"
+    [none]="buun||"
+)
+
+# ── GPU registry ────────────────────────────────────────────────────
+declare -A GPU_MAP=(
+    [0]="0" [4090]="0"
+    [1]="1" [3090]="1" [3090ti]="1"
+    [both]="0,1" [all]="0,1" [0,1]="0,1" [1,0]="0,1"
+)
+
+declare -A GPU_NAMES=(
+    [0]="RTX 4090"
+    [1]="RTX 3090 Ti"
+    [0,1]="RTX 4090 + RTX 3090 Ti"
+)
+
+# ── Helpers ─────────────────────────────────────────────────────────
+parse_ctx() {
+    local raw="$1"
+    # Accept: 128k, 128K, 131072, 64k, etc.
+    if [[ "$raw" =~ ^([0-9]+)[kK]$ ]]; then
+        echo $(( ${BASH_REMATCH[1]} * 1024 ))
+    else
+        echo "$raw"
+    fi
+}
+
+get_running_info() {
+    # Returns info about currently running llama-server, if any
+    local pid
+    pid=$(pgrep -f 'llama-server.*--port' 2>/dev/null | head -1) || true
+    if [[ -n "$pid" ]]; then
+        echo "$pid"
+    fi
+}
+
+update_ccr() {
+    # Update claude-code-router config with the model on the given port
+    local model_gguf="$1" port="$2"
+    local host_ip
+    if [[ "$SERVER_HOST" == "auto" ]]; then
+        host_ip=$(hostname -I | awk '{print $1}')
+    else
+        host_ip="$SERVER_HOST"
+    fi
+    local provider="buun-local"
+    local url="http://${host_ip}:${port}/v1/chat/completions"
+
+    if [[ ! -f "$CCR_CONFIG" ]]; then
+        echo -e "  ${D}CCR config not found, skipping.${R}"
+        return
+    fi
+
+    # Read existing config, update Router slots and ensure model is in provider
+    python3 -c "
+import json, sys
+with open('$CCR_CONFIG') as f:
+    cfg = json.load(f)
+model = '$model_gguf'
+provider = '$provider'
+url = '$url'
+entry = f'{provider},{model}'
+# Update router
+cfg['Router'] = {'default': entry, 'think': entry, 'background': entry}
+# Ensure provider exists and has the model + correct url
+found = False
+for p in cfg.get('Providers', []):
+    if p['name'] == provider:
+        p['api_base_url'] = url
+        if model not in p.get('models', []):
+            p['models'].append(model)
+        found = True
+        break
+if not found:
+    cfg.setdefault('Providers', []).append({
+        'name': provider, 'api_base_url': url,
+        'api_key': 'local', 'models': [model]
+    })
+with open('$CCR_CONFIG', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+    echo -e "  ${C}CCR${R}  → $model_gguf ${D}(all slots)${R}"
+}
+
+print_status_line() {
+    local pid="$1"
+    if [[ -z "$pid" ]]; then
+        echo -e "${D}No llama-server running.${R}"
+        return
+    fi
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || {
+        echo -e "${D}No llama-server running.${R}"
+        return
+    }
+
+    # Extract key info from cmdline
+    local model_path kv_k kv_v ctx np port gpu_env binary
+    model_path=$(echo "$cmdline" | grep -oP '(?<=-m )\S+' || echo "?")
+    kv_k=$(echo "$cmdline" | grep -oP '(?<=--cache-type-k |(?<=-ctk ))\S+' || echo "none")
+    kv_v=$(echo "$cmdline" | grep -oP '(?<=--cache-type-v |(?<=-ctv ))\S+' || echo "none")
+    ctx=$(echo "$cmdline" | grep -oP '(?<=-c )\S+' || echo "?")
+    np=$(echo "$cmdline" | grep -oP '(?<=-np )\S+' || echo "1")
+    port=$(echo "$cmdline" | grep -oP '(?<=--port )\S+' || echo "?")
+
+    # Resolve model name
+    local model_name
+    model_name=$(basename "$model_path" .gguf)
+
+    # Resolve binary type
+    if echo "$cmdline" | grep -q 'rotorquant'; then
+        binary="rotor"
+    elif echo "$cmdline" | grep -q 'buun'; then
+        binary="buun"
+    else
+        binary="?"
+    fi
+
+    # Format context
+    local ctx_display="$ctx"
+    if [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx >= 1024 )); then
+        ctx_display="$(( ctx / 1024 ))k"
+    fi
+
+    echo -e "${B}${G}●${R} ${B}$model_name${R}"
+    echo -e "  ${C}PID${R}    $pid"
+    echo -e "  ${C}Binary${R} $binary"
+    echo -e "  ${C}KV${R}     -ctk $kv_k  -ctv $kv_v"
+    echo -e "  ${C}Ctx${R}    ${np}×${ctx_display}"
+    echo -e "  ${C}Port${R}   $port"
+
+    # VRAM usage from nvidia-smi
+    if command -v nvidia-smi &>/dev/null; then
+        echo -e "  ${C}VRAM${R}"
+        nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | while IFS= read -r line; do
+            local idx name used total
+            idx=$(echo "$line" | cut -d',' -f1 | xargs)
+            name=$(echo "$line" | cut -d',' -f2 | xargs)
+            used=$(echo "$line" | cut -d',' -f3 | xargs)
+            total=$(echo "$line" | cut -d',' -f4 | xargs)
+            local pct=$(( used * 100 / total ))
+            local color="$G"
+            (( pct > 70 )) && color="$Y"
+            (( pct > 90 )) && color="$RD"
+            echo -e "    ${D}GPU $idx${R} ${name}: ${color}${used}${R}/${total} MiB ${D}(${pct}%)${R}"
+        done
+    fi
+}
+
+# ── Commands ────────────────────────────────────────────────────────
+cmd_models() {
+    echo -e "${B}Available models:${R}\n"
+    for name in $(echo "${!MODEL_PATHS[@]}" | tr ' ' '\n' | sort); do
+        local path="${MODEL_PATHS[$name]}"
+        local size="${MODEL_SIZES[$name]}"
+        if [[ -f "$path" ]]; then
+            echo -e "  ${G}●${R} ${B}$name${R}  ${D}($size)${R}"
+        else
+            echo -e "  ${RD}○${R} ${D}$name  ($size) — missing${R}"
+        fi
+    done
+    echo ""
+    echo -e "${B}KV cache modes:${R}\n"
+    echo -e "  ${C}tcq${R}          turbo3_tcq      ${D}(buun — best compression)${R}"
+    echo -e "  ${C}tcq2${R}         turbo2_tcq      ${D}(buun — lighter)${R}"
+    echo -e "  ${C}rotor${R}        iso3            ${D}(rotorquant — faster prefill)${R}"
+    echo -e "  ${C}rotor-planar${R} planar3         ${D}(rotorquant — alternative)${R}"
+    echo -e "  ${C}rotor4${R}       iso4            ${D}(rotorquant — 4-bit)${R}"
+    echo -e "  ${C}q8${R}           q8_0            ${D}(standard 8-bit)${R}"
+    echo -e "  ${C}q4${R}           q4_0            ${D}(standard 4-bit)${R}"
+    echo -e "  ${C}f16${R}          f16             ${D}(full precision KV)${R}"
+    echo -e "  ${C}none${R}         —               ${D}(no KV quantization)${R}"
+    echo ""
+    echo -e "${B}GPUs:${R}\n"
+    echo -e "  ${C}0${R} / ${C}4090${R}     RTX 4090"
+    echo -e "  ${C}1${R} / ${C}3090${R}     RTX 3090 Ti"
+    echo -e "  ${C}both${R}         Both GPUs (tensor-parallel split)"
+}
+
+cmd_status() {
+    local pid
+    pid=$(get_running_info)
+    echo ""
+    print_status_line "$pid"
+    echo ""
+}
+
+cmd_down() {
+    local pid
+    pid=$(get_running_info)
+    if [[ -z "$pid" ]]; then
+        echo -e "${D}No llama-server running.${R}"
+        return
+    fi
+    echo -e "Stopping llama-server (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
+    # Wait for it to die
+    for i in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo -e "${G}✓${R} Stopped."
+            return
+        fi
+        sleep 0.5
+    done
+    echo -e "${Y}Force killing...${R}"
+    kill -9 "$pid" 2>/dev/null || true
+    echo -e "${G}✓${R} Killed."
+}
+
+cmd_up() {
+    local model="" kv="$DEFAULT_KV" gpu="$DEFAULT_GPU" ctx="$DEFAULT_CTX"
+    local np="$DEFAULT_NP" port="$DEFAULT_PORT" extra_args=()
+    local kv_was_explicit=false
+    local flash_attn=true
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --kv)       kv="$2"; kv_was_explicit=true; shift 2 ;;
+            --gpu)      gpu="$2"; shift 2 ;;
+            --ctx)      ctx="$2"; shift 2 ;;
+            --np)       np="$2"; shift 2 ;;
+            --port)     port="$2"; shift 2 ;;
+            --nfa)      flash_attn=false; shift ;;
+            --*)        extra_args+=("$1" "$2"); shift 2 ;;
+            *)
+                if [[ -z "$model" ]]; then
+                    model="$1"
+                else
+                    extra_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate model
+    if [[ -z "$model" ]]; then
+        echo -e "${RD}Error:${R} No model specified.\n"
+        echo "Usage: llm up <model> [--kv tcq|rotor|...] [--gpu 0|1|4090|3090] [--ctx 128k] [--np 1]"
+        echo ""
+        echo "Models: ${!MODEL_PATHS[*]}"
+        return 1
+    fi
+
+    if [[ -z "${MODEL_PATHS[$model]+x}" ]]; then
+        echo -e "${RD}Error:${R} Unknown model '$model'"
+        echo "Available: ${!MODEL_PATHS[*]}"
+        return 1
+    fi
+
+    local model_path="${MODEL_PATHS[$model]}"
+    if [[ ! -f "$model_path" ]]; then
+        echo -e "${RD}Error:${R} Model file not found: $model_path"
+        return 1
+    fi
+
+    # Validate KV preset
+    if [[ -z "${KV_PRESETS[$kv]+x}" ]]; then
+        echo -e "${RD}Error:${R} Unknown KV preset '$kv'"
+        echo "Available: ${!KV_PRESETS[*]}"
+        return 1
+    fi
+
+    # Parse KV preset
+    IFS='|' read -r kv_binary ctk ctv <<< "${KV_PRESETS[$kv]}"
+    local binary
+    if [[ "$kv_binary" == "rotor" ]]; then
+        binary="$ROTOR_BIN"
+    else
+        binary="$BUUN_BIN"
+    fi
+
+    # Resolve GPU
+    if [[ -z "${GPU_MAP[$gpu]+x}" ]]; then
+        echo -e "${RD}Error:${R} Unknown GPU '$gpu'"
+        echo "Available: 0/4090, 1/3090/3090ti, both"
+        return 1
+    fi
+    local cuda_dev="${GPU_MAP[$gpu]}"
+    local gpu_name="${GPU_NAMES[$cuda_dev]}"
+
+    # Parse context
+    local ctx_num
+    ctx_num=$(parse_ctx "$ctx")
+
+    # Kill existing server if running
+    local existing_pid
+    existing_pid=$(get_running_info)
+    if [[ -n "$existing_pid" ]]; then
+        echo -e "${Y}Stopping existing server (PID $existing_pid)...${R}"
+        kill "$existing_pid" 2>/dev/null || true
+        sleep 1
+        kill -0 "$existing_pid" 2>/dev/null && kill -9 "$existing_pid" 2>/dev/null
+        sleep 0.5
+    fi
+
+    # Build command — ctx is per-slot, multiply by np for total
+    local total_ctx=$(( ctx_num * np ))
+    local cmd_args=(
+        -m "$model_path"
+        -ngl 99
+        -c "$total_ctx"
+        -np "$np"
+        -fit off
+        --host 0.0.0.0
+        --port "$port"
+    )
+
+    # Add KV cache flags if set
+    if [[ -n "$ctk" ]]; then
+        cmd_args+=(-ctk "$ctk" -ctv "$ctv")
+    fi
+
+    # Flash attention (disabled with --nfa for multi-GPU + quantized KV)
+    if [[ "$flash_attn" == true ]]; then
+        cmd_args+=(--flash-attn on)
+    else
+        cmd_args+=(--flash-attn off)
+    fi
+
+    # Add any extra args
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        cmd_args+=("${extra_args[@]}")
+    fi
+
+    # Context display
+    local ctx_display="$ctx_num"
+    if (( ctx_num >= 1024 )); then
+        ctx_display="$(( ctx_num / 1024 ))k"
+    fi
+
+    # Print launch summary
+    echo ""
+    echo -e "${B}Launching llama-server${R}"
+    echo -e "  ${C}Model${R}   $model ${D}(${MODEL_SIZES[$model]})${R}"
+    echo -e "  ${C}Binary${R}  $kv_binary ${D}($binary)${R}"
+    echo -e "  ${C}GPU${R}     $gpu_name ${D}(CUDA $cuda_dev)${R}"
+    echo -e "  ${C}KV${R}      $kv ${D}(${ctk:-none})${R}"
+    [[ "$flash_attn" == false ]] && echo -e "  ${C}FA${R}      ${RD}off${R}"
+    echo -e "  ${C}Ctx${R}     ${np}×${ctx_display}"
+    echo -e "  ${C}Port${R}    $port"
+    echo ""
+
+    # Launch
+    CUDA_VISIBLE_DEVICES="$cuda_dev" nohup "$binary" "${cmd_args[@]}" \
+        > /tmp/llm-server.log 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PIDFILE"
+
+    echo -e "${D}Waiting for server to be ready...${R}"
+
+    # Wait for health endpoint
+    local ready=false
+    for i in $(seq 1 60); do
+        if curl -sf "http://localhost:$port/health" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        # Check process is still alive
+        if ! kill -0 "$new_pid" 2>/dev/null; then
+            echo -e "\n${RD}✗ Server died during startup. Last log:${R}"
+            tail -20 /tmp/llm-server.log
+            return 1
+        fi
+        printf "."
+        sleep 1
+    done
+
+    if $ready; then
+        echo -e "\n${G}✓${R} ${B}Server ready${R} at http://localhost:$port ${D}(PID $new_pid)${R}"
+        # Update CCR config — model name is the gguf filename
+        local model_gguf
+        model_gguf=$(basename "$model_path")
+        update_ccr "$model_gguf" "$port"
+    else
+        echo -e "\n${Y}⚠ Server started (PID $new_pid) but health check timed out after 60s.${R}"
+        echo -e "  Check logs: ${D}tail -f /tmp/llm-server.log${R}"
+    fi
+    echo ""
+}
+
+cmd_logs() {
+    local lines="${1:-50}"
+    if [[ -f /tmp/llm-server.log ]]; then
+        tail -n "$lines" /tmp/llm-server.log
+    else
+        echo -e "${D}No log file found.${R}"
+    fi
+}
+
+cmd_add() {
+    local url="" name_override=""
+    
+    # Parse optional --name flag
+    if [[ "${1:-}" == "--name" ]]; then
+        name_override="${2:-}"
+        url="${3:-}"
+    elif [[ "${2:-}" == "--name" ]]; then
+        url="${1:-}"
+        name_override="${3:-}"
+    else
+        url="${1:-}"
+    fi
+    
+    if [[ -z "$url" ]]; then
+        echo -e "${RD}Error:${R} No URL provided."
+        echo "Usage: llm add [--name MODEL_NAME] <huggingface-url>"
+        echo ""
+        echo "Example:"
+        echo "  llm add https://huggingface.co/bartowski/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf"
+        return 1
+    fi
+    
+    # Parse HF URL - handle both formats:
+    # 1. Direct download: https://huggingface.co/REPO/resolve/BRANCH/FILE.gguf
+    # 2. Repo page with query: https://huggingface.co/REPO?show_file_info=FILE.gguf
+    
+    if [[ ! "$url" =~ huggingface\.co ]]; then
+        echo -e "${RD}Error:${R} Not a Hugging Face URL"
+        return 1
+    fi
+    
+    local repo filename original_url="$url"
+    
+    # Check if it's a query-based URL first
+    if [[ "$url" =~ \?show_file_info=([^&]+) ]]; then
+        filename="${BASH_REMATCH[1]}"
+        # Extract repo from base URL (before the ?)
+        local base_url="${url%%\?*}"
+        if [[ "$base_url" =~ huggingface\.co/([^/]+/[^/]+)/?$ ]]; then
+            repo="${BASH_REMATCH[1]}"
+        else
+            echo -e "${RD}Error:${R} Could not parse repo from URL"
+            return 1
+        fi
+    else
+        # Strip any remaining query parameters
+        url="${url%%\?*}"
+        
+        # Extract repo (everything between huggingface.co/ and /resolve/ or /blob/)
+        if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/(resolve|blob)/ ]]; then
+            repo="${BASH_REMATCH[1]}"
+            # Extract filename (last component)
+            filename=$(basename "$url")
+        else
+            echo -e "${RD}Error:${R} Could not parse URL"
+            echo "Expected format:"
+            echo "  https://huggingface.co/USER/REPO/resolve/BRANCH/FILE.gguf"
+            echo "  or"
+            echo "  https://huggingface.co/USER/REPO?show_file_info=FILE.gguf"
+            return 1
+        fi
+    fi
+    
+    if [[ ! "$filename" =~ \.gguf$ ]]; then
+        echo -e "${Y}Warning:${R} Filename doesn't end in .gguf: $filename"
+    fi
+    
+    echo -e "${B}Model Download${R}"
+    echo -e "  ${C}Repo${R}     $repo"
+    echo -e "  ${C}File${R}     $filename"
+    echo ""
+    
+    # Auto-detect model family from filename
+    local family="" quant="" variant="" size="" version=""
+    
+    # Extract variant/finetune name (first word before common patterns)
+    # Allow dots (e.g. "Qwen3.6"), stop at first - or _
+    if [[ "$filename" =~ ^([A-Za-z][A-Za-z0-9.]*) ]]; then
+        variant="${BASH_REMATCH[1],,}"  # lowercase
+    fi
+    
+    # Detect base family
+    if [[ "$filename" =~ ([gG]emma) ]]; then
+        family="gemma"
+    elif [[ "$filename" =~ ([cC]arnice) ]]; then
+        family="carnice"
+        variant="carnice"
+    elif [[ "$filename" =~ ([qQ]w[oa]pus) ]]; then
+        family="qwopus"
+        variant="qwopus"
+    elif [[ "$filename" =~ ([qQ]wen) ]]; then
+        family="qwen"
+    elif [[ "$filename" =~ ([lL]lama) ]]; then
+        family="llama"
+    else
+        family="${variant:-unknown}"
+    fi
+    
+    # Extract parameter size (e.g., 27B, 35B, 7b, etc. — case-insensitive on B)
+    if [[ "$filename" =~ ([0-9]+\.?[0-9]*)[Bb] ]]; then
+        size="${BASH_REMATCH[1]}b"
+    fi
+
+    # Extract optional version marker (e.g. -V2, -v3, _v10)
+    if [[ "$filename" =~ [-_][Vv]([0-9]+) ]]; then
+        version="v${BASH_REMATCH[1]}"
+    fi
+    
+    # Extract quant level
+    if [[ "$filename" =~ (IQ[0-9]+_[A-Z]+|Q[0-9]+_K_[A-Z]+|Q[0-9]+_[0-9]+|Q[0-9]+_K) ]]; then
+        quant="${BASH_REMATCH[1]}"
+    else
+        quant="unknown"
+    fi
+    
+    # Generate model name
+    # Priority: variant-size-quant or family-size-quant
+    local model_name
+    if [[ -n "$name_override" ]]; then
+        model_name="$name_override"
+    else
+        # Build name from components
+        local name_parts=()
+        
+        # Use distinctive variant name, or fall back to family
+        if [[ -n "$variant" && "$variant" != "$family" ]]; then
+            name_parts+=("$variant")
+        else
+            name_parts+=("$family")
+        fi
+
+        # Add version marker if detected (e.g. v2)
+        if [[ -n "$version" ]]; then
+            name_parts+=("$version")
+        fi
+
+        # Add size if detected
+        if [[ -n "$size" ]]; then
+            name_parts+=("$size")
+        fi
+
+        # Add quant
+        name_parts+=("$quant")
+        
+        # Join with hyphens
+        model_name=$(IFS=-; echo "${name_parts[*]}")
+    fi
+    
+    echo -e "  ${C}Detected${R} family=${family}, variant=${variant:-none}, version=${version:-none}, size=${size:-unknown}, quant=${quant}"
+    echo -e "  ${C}Name${R}     ${B}${model_name}${R}"
+    echo ""
+    
+    # Check if name already exists
+    if [[ -n "${MODEL_PATHS[$model_name]+x}" ]]; then
+        echo -e "${RD}Error:${R} Model name '$model_name' already exists."
+        echo "Use --name to specify a different name."
+        return 1
+    fi
+    
+    # Create target directory
+    local target_dir="$MODELS_DIR/${family}"
+    mkdir -p "$target_dir"
+    local target_path="$target_dir/$filename"
+    
+    # Check if file already exists
+    if [[ -f "$target_path" ]]; then
+        echo -e "${Y}File already exists:${R} $target_path"
+        read -p "Overwrite? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return 1
+        fi
+    fi
+    
+    # Download using hf CLI
+    echo -e "${D}Downloading...${R}"
+    if ! command -v hf &>/dev/null; then
+        echo -e "${RD}Error:${R} hf CLI not found. Install with: pip install huggingface-hub[cli]"
+        return 1
+    fi
+    
+    if ! hf download "$repo" "$filename" --local-dir "$target_dir"; then
+        echo -e "${RD}✗ Download failed${R}"
+        return 1
+    fi
+    
+    echo -e "${G}✓${R} Downloaded to $target_path"
+    
+    # Get file size
+    local size_bytes size_display
+    size_bytes=$(stat -c%s "$target_path" 2>/dev/null || stat -f%z "$target_path" 2>/dev/null)
+    if [[ -n "$size_bytes" ]]; then
+        # Convert to GB with 1 decimal
+        size_display=$(awk "BEGIN {printf \"%.0fG\", $size_bytes/1024/1024/1024}")
+    else
+        size_display="?"
+    fi
+    
+    echo -e "  ${C}Size${R}     $size_display"
+    echo ""
+    
+    # Update registry file
+    echo -e "${D}Updating registry...${R}"
+
+    # Lazy-init registry if it doesn't exist yet
+    if [[ ! -f "$REGISTRY_FILE" ]]; then
+        mkdir -p "$(dirname "$REGISTRY_FILE")"
+        cat > "$REGISTRY_FILE" <<'INIT'
+# llm registry — managed by `llm add` / `llm remove`. Do not commit.
+declare -gA MODEL_PATHS=(
+)
+
+declare -gA MODEL_SIZES=(
+)
+INIT
+    fi
+
+    # Insert into MODEL_PATHS and MODEL_SIZES (before each array's closing paren)
+    local model_paths_end model_sizes_end
+    model_paths_end=$(grep -n "^)" "$REGISTRY_FILE" | head -1 | cut -d: -f1)
+    sed -i "${model_paths_end}i\\    [${model_name}]=\"${target_path}\"" "$REGISTRY_FILE"
+
+    model_sizes_end=$(grep -n "^)" "$REGISTRY_FILE" | sed -n '2p' | cut -d: -f1)
+    sed -i "${model_sizes_end}i\\    [${model_name}]=\"${size_display}\"" "$REGISTRY_FILE"
+
+    echo -e "  ${G}✓${R} Added to registry"
+    
+    # Update Hermes config
+    echo -e "${D}Updating Hermes config...${R}"
+    
+    local hermes_config="$HERMES_CONFIG"
+    if [[ ! -f "$hermes_config" ]]; then
+        echo -e "  ${Y}⚠${R} Hermes config not found, skipping"
+    else
+        # Use Python to add to custom_providers
+        python3 <<EOF
+import yaml
+import sys
+
+config_path = "$hermes_config"
+model_name = "$model_name"
+filename = "$filename"
+
+with open(config_path) as f:
+    config = yaml.safe_load(f)
+
+# Ensure custom_providers exists
+if 'custom_providers' not in config:
+    config['custom_providers'] = []
+
+# Add new provider entry
+new_provider = {
+    'name': f'{model_name.title()} (buun-llama-cpp)',
+    'base_url': 'http://localhost:8081/v1',
+    'model': filename
+}
+
+config['custom_providers'].append(new_provider)
+
+with open(config_path, 'w') as f:
+    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+print(f"  Added to custom_providers as: {new_provider['name']}")
+EOF
+        
+        if [[ $? -eq 0 ]]; then
+            echo -e "  ${G}✓${R} Added to Hermes config"
+        else
+            echo -e "  ${RD}✗${R} Failed to update Hermes config"
+        fi
+    fi
+    
+    echo ""
+    echo -e "${G}✓${R} ${B}Model added successfully${R}"
+    echo -e "  Launch with: ${C}llm up $model_name${R}"
+    echo ""
+}
+
+cmd_remove() {
+    local names=() keep_file=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-file) keep_file=true; shift ;;
+            -*)
+                echo -e "${RD}Error:${R} Unknown option '$1'"
+                echo "Usage: llm remove [--keep-file] <model-name> [<model-name>...]"
+                return 1
+                ;;
+            *)
+                names+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        echo -e "${RD}Error:${R} No model name provided."
+        echo "Usage: llm remove [--keep-file] <model-name> [<model-name>...]"
+        echo ""
+        echo "Available: ${!MODEL_PATHS[*]}"
+        return 1
+    fi
+
+    # Capture currently-running model path once (for guard below)
+    local running_pid running_path=""
+    running_pid=$(get_running_info)
+    if [[ -n "$running_pid" ]]; then
+        local cmdline
+        cmdline=$(tr '\0' ' ' < "/proc/$running_pid/cmdline" 2>/dev/null) || cmdline=""
+        running_path=$(echo "$cmdline" | grep -oP '(?<=-m )\S+' || true)
+    fi
+
+    # Pre-validate all names (fail before touching anything)
+    local name
+    for name in "${names[@]}"; do
+        if [[ -z "${MODEL_PATHS[$name]+x}" ]]; then
+            echo -e "${RD}Error:${R} Unknown model '$name'"
+            echo "Available: ${!MODEL_PATHS[*]}"
+            return 1
+        fi
+        if [[ -n "$running_path" && "$running_path" == "${MODEL_PATHS[$name]}" ]]; then
+            echo -e "${RD}Error:${R} '$name' is currently running (PID $running_pid)."
+            echo -e "  Stop it first: ${C}llm down${R}"
+            return 1
+        fi
+    done
+
+    # Plan summary
+    echo -e "${B}Removing ${#names[@]} model(s):${R}"
+    for name in "${names[@]}"; do
+        local model_path="${MODEL_PATHS[$name]}"
+        local filename
+        filename=$(basename "$model_path")
+        local file_state
+        if [[ "$keep_file" == true ]]; then
+            file_state="${Y}keep${R}"
+        elif [[ -f "$model_path" ]]; then
+            file_state="${RD}delete${R}"
+        else
+            file_state="${D}absent${R}"
+        fi
+        echo -e "  ${B}$name${R}  ${D}(${MODEL_SIZES[$name]:-?})${R}  → file: $file_state"
+
+        # CCR drift detection (read-only — we don't modify CCR, cmd_up does)
+        if [[ -f "$CCR_CONFIG" ]]; then
+            local ccr_state
+            ccr_state=$(python3 - "$CCR_CONFIG" "$filename" 2>/dev/null <<'PY' || true
+import json, sys
+ccr_path, filename = sys.argv[1], sys.argv[2]
+try:
+    with open(ccr_path) as f:
+        cfg = json.load(f)
+    if any(isinstance(s, str) and s.endswith(',' + filename) for s in cfg.get('Router', {}).values()):
+        print("ROUTER")
+    elif any(filename in p.get('models', []) for p in cfg.get('Providers', [])):
+        print("MODELS")
+except Exception:
+    pass
+PY
+)
+            case "$ccr_state" in
+                ROUTER) echo -e "    ${Y}⚠${R}  CCR Router currently routes here — re-route after with: ${C}llm up <other>${R}" ;;
+                MODELS) echo -e "    ${D}note: stale CCR provider entry will remain (harmless)${R}" ;;
+            esac
+        fi
+    done
+
+    echo ""
+    read -p "Proceed? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        return 1
+    fi
+
+    # Perform removals
+    local hermes_config="$HERMES_CONFIG"
+
+    for name in "${names[@]}"; do
+        local model_path="${MODEL_PATHS[$name]}"
+        local filename
+        filename=$(basename "$model_path")
+        local escaped_name="${name//./\\.}"
+
+        echo -e "${B}$name${R}"
+
+        # 1+2. Strip MODEL_PATHS and MODEL_SIZES entries from registry
+        if [[ -f "$REGISTRY_FILE" ]]; then
+            sed -i "/^[[:space:]]*\[${escaped_name}\][[:space:]]*=/d" "$REGISTRY_FILE"
+        fi
+        echo -e "  ${G}✓${R} Removed from registry"
+
+        # 3. Strip from Hermes config
+        if [[ -f "$hermes_config" ]]; then
+            if python3 - "$hermes_config" "$filename" <<'PY'
+import yaml, sys
+config_path, filename = sys.argv[1], sys.argv[2]
+with open(config_path) as f:
+    config = yaml.safe_load(f) or {}
+before = config.get('custom_providers', []) or []
+after = [p for p in before if p.get('model') != filename]
+if len(before) != len(after):
+    config['custom_providers'] = after
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+PY
+            then
+                echo -e "  ${G}✓${R} Updated Hermes config"
+            else
+                echo -e "  ${RD}✗${R} Failed to update Hermes config"
+            fi
+        fi
+
+        # 4. Optionally delete the GGUF file (and empty parent dir)
+        if [[ "$keep_file" != true ]] && [[ -f "$model_path" ]]; then
+            rm -f "$model_path"
+            echo -e "  ${G}✓${R} Deleted $model_path"
+            local parent_dir
+            parent_dir=$(dirname "$model_path")
+            if [[ -d "$parent_dir" ]] && [[ -z "$(ls -A "$parent_dir" 2>/dev/null)" ]]; then
+                rmdir "$parent_dir" 2>/dev/null && \
+                    echo -e "  ${G}✓${R} Removed empty $parent_dir"
+            fi
+        fi
+    done
+
+    echo ""
+    echo -e "${G}✓${R} ${B}${#names[@]} model(s) removed${R}"
+    echo ""
+}
+
+cmd_help() {
+    echo ""
+    echo -e "${B}llm${R} — Local LLM server launcher"
+    echo ""
+    echo -e "${B}USAGE${R}"
+    echo "  llm up <model> [options]    Start a model server"
+    echo "  llm down                    Stop the running server"
+    echo "  llm status                  Show what's running + VRAM"
+    echo "  llm models                  List models, KV modes, GPUs"
+    echo "  llm add <url>               Download and register a new model"
+    echo "  llm remove <name>           Unregister and delete a model"
+    echo "  llm logs [N]                Show last N lines of server log"
+    echo ""
+    echo -e "${B}OPTIONS${R}"
+    echo "  --kv <mode>     KV cache: tcq, rotor, rotor-planar, q8, f16, none  (default: f16)"
+    echo "  --gpu <id>      GPU: 0/4090, 1/3090, both  (default: 0)"
+    echo "  --ctx <size>    Context length per slot: 128k, 64k, 32k, etc.  (default: 128k)"
+    echo "  --np <slots>    Number of parallel context slots  (default: 1)"
+    echo "  --nfa           Disable flash attention (needed for some KV types on multi-GPU)"
+  echo "  --port <port>   Server port  (default: 8081)"
+    echo ""
+    echo -e "${B}EXAMPLES${R}"
+    echo "  llm up carnice-q4                              # 4090, f16, 1×128k"
+    echo "  llm up gemma4 --kv rotor --gpu 3090            # 3090 Ti, RotorQuant"
+    echo "  llm up carnice-q6 --kv tcq --ctx 32k           # TCQ KV, 32k ctx"
+    echo "  llm up qwopus --np 2 --kv tcq                  # 2×128k slots, TCQ"
+    echo "  llm up gemma4 --gpu both --np 2 --ctx 64k      # Both GPUs, 2×64k"
+    echo "  llm up carnice-q4 --gpu both --np 4 --ctx 32k  # Both GPUs, 4×32k"
+    echo ""
+    echo "  llm add https://huggingface.co/bartowski/model-GGUF/resolve/main/model-Q4.gguf"
+    echo "  llm add --name custom-name https://huggingface.co/..."
+    echo ""
+    echo "  llm remove gemma-31b-Q4_K_M                    # Unregister + delete .gguf"
+    echo "  llm remove gemma-31b-Q4_K_M --keep-file        # Unregister, keep .gguf"
+    echo ""
+}
+
+# ── Main ────────────────────────────────────────────────────────────
+case "${1:-help}" in
+    up)      shift; cmd_up "$@" ;;
+    down)    cmd_down ;;
+    status)  cmd_status ;;
+    models)  cmd_models ;;
+    add)     shift; cmd_add "$@" ;;
+    remove|rm) shift; cmd_remove "$@" ;;
+    logs)    shift; cmd_logs "${1:-50}" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+        echo -e "${RD}Unknown command:${R} $1"
+        cmd_help
+        exit 1
+        ;;
+esac

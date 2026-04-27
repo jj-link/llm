@@ -1,0 +1,38 @@
+# llm — user config
+#
+# Copy to ~/.config/llm/config (or any path and point $LLM_CONFIG at it),
+# uncomment the lines you want to override, and edit values to taste.
+# Anything left commented falls back to the script's built-in defaults.
+#
+# This file is sourced by bash, so standard shell rules apply: use export
+# to make a variable visible to subprocesses (the python3 helpers in
+# cmd_add/cmd_remove are subprocesses, so export everything you set).
+
+# ── Where downloaded GGUFs live ─────────────────────────────────────
+# Default: $HOME/models
+#export LLM_MODELS_DIR="$HOME/models"
+
+# ── llama-server binaries ───────────────────────────────────────────
+# Two builds are supported: buun (default) and rotorquant (selected via
+# certain --kv presets). Point each at the llama-server binary you built.
+#export LLM_BUUN_BIN="$HOME/buun-llama-cpp/build/bin/llama-server"
+#export LLM_ROTOR_BIN="$HOME/rotorquant-llama-cpp/build/bin/llama-server"
+
+# ── Defaults for `llm up` ───────────────────────────────────────────
+# Override per-invocation with --port / --ctx / --kv / --gpu.
+#export LLM_PORT=8081
+#export LLM_CTX=128k          # accepts e.g. 128k, 64k, 32k, or raw token counts
+#export LLM_KV=f16            # tcq | tcq2 | rotor | rotor-planar | rotor4 | q8 | q4 | f16 | none
+#export LLM_GPU=0             # 0 / 4090, 1 / 3090 / 3090ti, both
+
+# ── Hermes provider config (optional integration) ───────────────────
+# llm add appends each new model to custom_providers in this YAML so
+# Hermes can route to your local llama-server. Comment out or point at
+# /dev/null to skip the integration.
+#export LLM_HERMES_CONFIG="$HOME/.hermes/config.yaml"
+
+# ── claude-code-router config (optional integration) ────────────────
+# Empty/unset = CCR integration disabled (recommended if you don't use
+# claude-code-router). When set, llm up rewrites Router slots to point
+# at the freshly-launched model.
+#export LLM_CCR_CONFIG="/mnt/c/Users/YOUR_USERNAME/.claude-code-router/config.json"
