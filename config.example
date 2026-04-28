@@ -13,8 +13,12 @@
 #export LLM_MODELS_DIR="$HOME/models"
 
 # ── llama-server binaries ───────────────────────────────────────────
-# Two builds are supported: buun (default) and rotorquant (selected via
-# certain --kv presets). Point each at the llama-server binary you built.
+# Three builds are supported, each selected by --kv preset:
+#   mainline llama.cpp   — q8
+#   buun-llama-cpp       — tcq, tcq2, q4, f16, none
+#   rotorquant-llama-cpp — rotor, rotor-planar, rotor4
+# Point each at the llama-server binary you built.
+#export LLM_LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-server"
 #export LLM_BUUN_BIN="$HOME/buun-llama-cpp/build/bin/llama-server"
 #export LLM_ROTOR_BIN="$HOME/rotorquant-llama-cpp/build/bin/llama-server"
 
