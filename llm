@@ -31,6 +31,7 @@ LLM_CONFIG_FILE="${LLM_CONFIG:-$HOME/.config/llm/config}"
 MODELS_DIR="${LLM_MODELS_DIR:-$HOME/models}"
 BUUN_BIN="${LLM_BUUN_BIN:-$HOME/buun-llama-cpp/build/bin/llama-server}"
 ROTOR_BIN="${LLM_ROTOR_BIN:-$HOME/rotorquant-llama-cpp/build/bin/llama-server}"
+LLAMA_BIN="${LLM_LLAMA_BIN:-$HOME/llama.cpp/build/bin/llama-server}"
 DEFAULT_PORT="${LLM_PORT:-8081}"
 DEFAULT_CTX="${LLM_CTX:-128k}"
 DEFAULT_KV="${LLM_KV:-f16}"
@@ -62,7 +63,7 @@ declare -A KV_PRESETS=(
     [rotor]="rotor|iso3|iso3"
     [rotor-planar]="rotor|planar3|planar3"
     [rotor4]="rotor|iso4|iso4"
-    [q8]="buun|q8_0|q8_0"
+    [q8]="llama|q8_0|q8_0"
     [q4]="buun|q4_0|q4_0"
     [f16]="buun|f16|f16"
     [none]="buun||"
@@ -334,6 +335,8 @@ cmd_up() {
     local binary
     if [[ "$kv_binary" == "rotor" ]]; then
         binary="$ROTOR_BIN"
+    elif [[ "$kv_binary" == "llama" ]]; then
+        binary="$LLAMA_BIN"
     else
         binary="$BUUN_BIN"
     fi
