@@ -395,6 +395,25 @@ cmd_up() {
         cmd_args+=(--flash-attn off)
     fi
 
+    # Mainline llama-server defaults for agent-style clients (Hermes, etc.):
+    # put model output in `content` instead of `reasoning_content`, and don't
+    # auto-prefill the assistant turn — both behaviors otherwise conflict with
+    # how agents retry thinking-only responses. Each is overridable by passing
+    # the flag explicitly.
+    if [[ "$kv_binary" == "llama" ]]; then
+        local has_reasoning_format=false has_prefill=false
+        if (( ${#extra_args[@]} > 0 )); then
+            for arg in "${extra_args[@]}"; do
+                case "$arg" in
+                    --reasoning-format) has_reasoning_format=true ;;
+                    --prefill-assistant|--no-prefill-assistant) has_prefill=true ;;
+                esac
+            done
+        fi
+        [[ "$has_reasoning_format" == false ]] && cmd_args+=(--reasoning-format none)
+        [[ "$has_prefill" == false ]] && cmd_args+=(--no-prefill-assistant)
+    fi
+
     # Add any extra args
     if [[ ${#extra_args[@]} -gt 0 ]]; then
         cmd_args+=("${extra_args[@]}")
